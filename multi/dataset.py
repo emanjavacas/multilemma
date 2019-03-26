@@ -132,10 +132,12 @@ class MultiLanguageEncoder:
 
     LanguageEncoder = collections.namedtuple('LanguageEncoder', ('char', 'lemma'))
 
-    def __init__(self, languages, shared=True, prepend=('char', 'lemma'), **kwargs):
+    def __init__(self, languages, share_encoder=True, share_decoder=True,
+                 prepend=('char', 'lemma'), **kwargs):
         self.char, self.lemma = {}, {}
         self.languages = languages
-        self.shared = shared
+        self.share_encoder = share_encoder
+        self.share_decoder = share_decoder
         self.prepend = prepend
 
         char = LabelEncoder(
@@ -146,8 +148,8 @@ class MultiLanguageEncoder:
             reserved=tuple(self.languages) if 'lemma' in prepend else (), **kwargs)
 
         for lang in languages:
-            self.char[lang] = char if shared else copy.deepcopy(char)
-            self.lemma[lang] = lemma if shared else copy.deepcopy(lemma)
+            self.char[lang] = char if share_encoder else copy.deepcopy(char)
+            self.lemma[lang] = lemma if share_decoder else copy.deepcopy(lemma)
 
         self.stats = collections.defaultdict(collections.Counter)
         self.known = collections.defaultdict(collections.Counter)
@@ -171,10 +173,10 @@ class MultiLanguageEncoder:
         for lang in self.languages:
             # trim ambiguous
             self.ambig[lang] = set(w for w, l in self.ambig[lang].items() if len(l) > 1)
-            if self.shared and self.char[lang].fitted:
-                continue
-            self.char[lang].compute_vocab()
-            self.lemma[lang].compute_vocab()
+            if not self.char[lang].fitted:
+                self.char[lang].compute_vocab()
+            if not self.lemma[lang].fitted:
+                self.lemma[lang].compute_vocab()
 
         if verbose:
             self.print_stats()
@@ -188,10 +190,11 @@ class MultiLanguageEncoder:
 
             print("Language:", lang)
             print('---' * 10)
-            if not self.shared:
+            if not self.share_encoder:
                 print("Character-level encoder")
                 print(self.char[lang])
                 print()
+            if not self.share_decoder:
                 print("Lemma-level encoder")
                 print(self.lemma[lang])
                 print()
@@ -206,13 +209,10 @@ class MultiLanguageEncoder:
             print()
             print()
 
-    def get_lang_encoder(self, lang=None):
-        if self.shared:
-            lang = next(iter(self.char))
-        else:
-            if lang is None:
-                raise ValueError("Unshared encoder requires `lang`")
+    def get_random_lang(self):
+        return next(iter(self.languages))
 
+    def get_lang_encoder(self, lang):
         return MultiLanguageEncoder.LanguageEncoder(self.char[lang], self.lemma[lang])
 
 
@@ -246,7 +246,12 @@ class MultiLanguageDataset:
         self.readers = readers
         self.iters = {lang: BatchIterator(r, batch_size) for lang, r in readers.items()}
 
-    def get_batches_oversampling(self):
+    def get_batches(self):
+        raise NotImplementedError
+
+
+class MultiLanguageOversampling(MultiLanguageDataset):
+    def get_batches(self):
         for lang in self.iters:
             self.iters[lang].reset()
 
@@ -265,7 +270,9 @@ class MultiLanguageDataset:
                 lang=lang, prepend=self.encoder.prepend)
             yield batch, lang
 
-    def get_batches_balanced(self):
+
+class MultiLanguageBalanced(MultiLanguageDataset):
+    def get_batches(self):
         for lang in self.iters:
             self.iters[lang].reset()
 

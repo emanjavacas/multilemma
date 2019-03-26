@@ -14,33 +14,71 @@ import torch.nn.functional as F
 
 from pie import torch_utils
 from pie import RNNEmbedding, AttentionalDecoder, RNNEncoder
-from dataset import prepare_batch, BatchIterator
-from dataset import MultiLanguageDataset, MultiLanguageEncoder, LanguageReader
+import dataset
 
 
 class Model(nn.Module):
-    def __init__(self, encoder, cemb_dim, hidden_size, num_layers, dropout=0.0,
-                 cemb_layers=1, cell='GRU', init_rnn='xavier_uniform', scorer='general'):
+    def __init__(self, encoder, cemb_dim, hidden_size, num_layers=0, dropout=0.0,
+                 cemb_layers=1, cell='GRU', init_rnn='xavier_uniform', scorer='general',
+                 prepend_dim=0):
         self.encoder = encoder
         self.dropout = dropout
         super().__init__()
 
-        encoder = encoder.get_lang_encoder()
-
         # Embeddings
-        self.cemb = RNNEmbedding(len(encoder.char), cemb_dim,
-                                 padding_idx=encoder.char.get_pad(), dropout=dropout,
-                                 num_layers=cemb_layers, cell=cell, init_rnn=init_rnn)
+        embedding_dim = None
+        if self.encoder.share_encoder:
+            encoder = self.encoder.get_lang_encoder(self.encoder.get_random_lang()).char
+            self.cemb = RNNEmbedding(
+                len(encoder), cemb_dim,
+                padding_idx=encoder.get_pad(), dropout=dropout,
+                num_layers=cemb_layers, cell=cell, init_rnn=init_rnn)
+            embedding_dim = self.cemb.embedding_dim
+        else:
+            cemb = {}
+            for lang, encoder in self.encoder.char.items():
+                lang_cemb = RNNEmbedding(
+                    len(encoder), cemb_dim,
+                    padding_idx=encoder.get_pad(), dropout=dropout,
+                    num_layers=cemb_layers, cell=cell, init_rnn=init_rnn)
+                self.add_module('{}-cemb'.format(lang), lang_cemb)
+                cemb[lang] = lang_cemb
+            self.cemb = cemb
+            embedding_dim = lang_cemb.embedding_dim
 
-        # TODO: Encoder
+        # Encoder
+        self.rnn_encoder = self.lang_encoder = self.lang_w2i = None
+        context_dim = 0
+        if num_layers > 0:
+            in_dim = embedding_dim
+            if prepend_dim:
+                self.lang_encoder = nn.Embedding(len(self.encoder.languages), prepend_dim)
+                in_dim += prepend_dim
+                self.lang_w2i = {lang: idx for idx, lang in enumerate(self.encoder.languages)}
+            self.rnn_encoder = RNNEncoder(in_dim, hidden_size, num_layers=num_layers,
+                                          cell=cell, dropout=dropout, init_rnn=init_rnn)
+            context_dim = hidden_size * 2
 
         # Decoder
-        self.decoder = AttentionalDecoder(
-            encoder.lemma, cemb_dim, self.cemb.embedding_dim,
-            # fix for now
-            context_dim=0,
-            scorer=scorer, num_layers=cemb_layers, cell=cell,
-            dropout=dropout, init_rnn=init_rnn)
+        if self.encoder.share_decoder:
+            encoder = self.encoder.get_lang_encoder(self.encoder.get_random_lang())
+            self.decoder = AttentionalDecoder(
+                encoder.lemma, cemb_dim, embedding_dim,
+                context_dim=context_dim,
+                scorer=scorer, num_layers=cemb_layers, cell=cell,
+                dropout=dropout, init_rnn=init_rnn)
+        else:
+            decoder = {}
+            for lang, encoder in self.encoder.lemma.items():
+                lang_decoder = AttentionalDecoder(
+                    encoder, cemb_dim, embedding_dim,
+                    # fix for now
+                    context_dim=context_dim,
+                    scorer=scorer, num_layers=cemb_layers, cell=cell,
+                    dropout=dropout, init_rnn=init_rnn)
+                self.add_module('{}-decoder'.format(lang), lang_decoder)
+                decoder[lang] = lang_decoder
+            self.decoder = decoder
 
     def device(self):
         return next(self.parameters()).device
@@ -49,26 +87,57 @@ class Model(nn.Module):
         ((_, wlen), (char, clen)), (lemma, llen) = batch_data
 
         # Embedding
-        cemb, cemb_outs = self.cemb(char, clen, wlen)
+        cemb = self.cemb if self.encoder.share_encoder else self.cemb[lang]
+        cemb, cemb_outs = cemb(char, clen, wlen)
+
+        # Encoder
+        context = None
+        if self.rnn_encoder is not None:
+            rnn_inp = cemb
+            if self.lang_encoder is not None:
+                lang_emb = torch.zeros_like(cemb[:, :, 0]).long() + self.lang_w2i[lang]
+                lang_emb = self.lang_encoder(lang_emb)
+                rnn_inp = torch.cat([lang_emb, rnn_inp], dim=2)
+            context = self.rnn_encoder(rnn_inp, wlen)[-1]
+            context = torch_utils.flatten_padded_batch(context, wlen)
 
         # Decoder
+        decoder = self.decoder if self.encoder.share_decoder else self.decoder[lang]
         cemb_outs = F.dropout(cemb_outs, p=self.dropout, training=self.training)
-        logits = self.decoder(lemma, llen, cemb_outs, clen)
-        loss = self.decoder.loss(logits, lemma)
+        logits = decoder(lemma, llen, cemb_outs, clen, context=context)
+        loss = decoder.loss(logits, lemma)
 
         return loss, sum(wlen).item()
 
     def predict(self, inp, lang, use_beam=False, width=10):
-        encoder = self.encoder.get_lang_encoder()
+        encoder = self.encoder.get_lang_encoder(lang)
+        # get modules
+        cemb = self.cemb if self.encoder.share_encoder else self.cemb[lang]
+        decoder = self.decoder if self.encoder.share_decoder else self.decoder[lang]
         # prepend with lang id
         bos = encoder.lemma.table[lang] if 'lemma' in self.encoder.prepend else None
 
         (_, wlen), (char, clen) = inp
-        cemb, cemb_outs = self.cemb(char, clen, wlen)
+        # Embedding
+        cemb, cemb_outs = cemb(char, clen, wlen)
+
+        # Encoder
+        context = None
+        if self.rnn_encoder is not None:
+            rnn_inp = cemb
+            if self.lang_encoder is not None:
+                lang_emb = torch.zeros_like(cemb[:, :, 0]).long() + self.lang_w2i[lang]
+                lang_emb = self.lang_encoder(lang_emb)
+                rnn_inp = torch.cat([lang_emb, rnn_inp], dim=2)
+            context = self.rnn_encoder(rnn_inp, wlen)[-1]
+            context = torch_utils.flatten_padded_batch(context, wlen)
+
+        # Decoder
         if use_beam:
-            hyps, _ = self.decoder.predict_beam(cemb_outs, clen, width=width, bos=bos)
+            hyps, _ = decoder.predict_beam(
+                cemb_outs, clen, context=context, width=width, bos=bos)
         else:
-            hyps, _ = self.decoder.predict_max(cemb_outs, clen, bos=bos)
+            hyps, _ = decoder.predict_max(cemb_outs, clen, context=context, bos=bos)
 
         if encoder.lemma.preprocessor_fn is None:
             hyps = [''.join(hyp) for hyp in hyps]
@@ -81,12 +150,12 @@ class Model(nn.Module):
         trues, preds = [], []
 
         with torch.no_grad(), tqdm.tqdm() as pbar:
-            it = BatchIterator(reader, batch_size)
+            it = dataset.BatchIterator(reader, batch_size)
             batches = iter(it)
             while not it.done:
                 pbar.update(batch_size)
                 sents, tasks = next(batches)
-                inp, target = prepare_batch(
+                inp, target = dataset.prepare_batch(
                     encoder, (sents, tasks), device=self.device(),
                     lang=lang, prepend=self.encoder.prepend)
                 hyps = self.predict(inp, lang, **kwargs)
@@ -108,7 +177,7 @@ class Model(nn.Module):
         acc_unk = float(accuracy_score(true_unk, pred_unk))
         return acc, acc_amb, acc_unk
 
-    def train_epoch(self, batches, optimizer, clip_norm, report_freq):
+    def train_epoch(self, batches, optimizer, clip_norm, report_freq, scheduler=None):
         stats = {}
         stats['loss'] = collections.defaultdict(float)
         stats['batches'] = collections.defaultdict(int)
@@ -121,7 +190,7 @@ class Model(nn.Module):
 
             # optimize
             optimizer.zero_grad()
-            loss.backward()
+            (scheduler.apply_weight(lang, loss) if scheduler else loss).backward()
             if clip_norm > 0:
                 nn.utils.clip_grad_norm_(self.parameters(), clip_norm)
             optimizer.step()
@@ -145,8 +214,8 @@ class Model(nn.Module):
                 stats['start'] = time.time()
                 stats['nwords'] = 0
 
-    def train_epochs(self, dataset, devreaders, epochs, sampling, clip_norm, report_freq,
-                     patience, lr_factor, optimizer, **kwargs):
+    def train_epochs(self, dataset, devreaders, epochs, clip_norm, report_freq, patience,
+                     lr_factor, optimizer, scheduler=None, target=None, **kwargs):
         optim = getattr(torch.optim, optimizer)(self.parameters(), **kwargs)
         best = tries = 0
         best_params = self.state_dict()
@@ -159,31 +228,37 @@ class Model(nn.Module):
 
             # train epoch
             self.train()
-            if sampling == 'oversampling':
-                batches = dataset.get_batches_oversampling()
-            else:
-                batches = dataset.get_batches_balanced()
-            self.train_epoch(batches, optim, clip_norm, report_freq)
+            self.train_epoch(
+                dataset.get_batches(), optim, clip_norm, report_freq,
+                scheduler=scheduler)
+            if scheduler is not None:
+                print(scheduler)
             self.eval()
 
             # evaluate
             total = 0
             for lang in sorted(devreaders):
-                acc, acc_amb, acc_unk = self.evaluate(readers[lang], lang)
-                total += acc
+                acc, acc_amb, acc_unk = self.evaluate(devreaders[lang], lang)
+                if scheduler is not None:
+                    scheduler.step(lang, acc)
+                if target is not None:
+                    if lang == target:
+                        total = acc
+                else:
+                    total += acc
                 print("Lang:", lang)
                 print("* Overall accuracy: {:.4f}".format(acc))
                 print("* Ambiguous accuracy: {:.4f}".format(acc_amb))
                 print("* Unknown accuracy: {:.4f}".format(acc_unk))
                 print()
-            acc = total / len(self.encoder.languages)
+            acc = total / (len(self.encoder.languages) if target is None else 1)
             print("* Epoch {} => Mean accuracy {:.4f}".format(epoch, acc))
 
             # monitor
             if acc - best <= 0.0001:
                 tries += 1
                 optim.param_groups[0]['lr'] *= lr_factor
-                print("* New learning rate: {:.4f}".format(optim.param_groups[0]['lr']))
+                print("* New learning rate: {:.8f}".format(optim.param_groups[0]['lr']))
             else:
                 tries = 0
                 best = acc
@@ -200,6 +275,55 @@ class Model(nn.Module):
         return best_params
 
 
+class Spec:
+    def __init__(self, mode='max', min_weight=0, factor=1, patience=2):
+        self.mode = mode
+        self.min_weight = min_weight
+        self.factor = factor
+        self.patience = patience
+        # state
+        self.weight = 1
+        self.fails = 0
+        self.best = float('inf')
+        if mode == 'max':
+            self.best = -self.best
+
+    def step(self, score):
+        if (score > self.best and self.mode == 'min') \
+           or (score < self.best and self.mode == 'max'):
+            self.fails += 1
+        else:
+            self.fails = 0
+            self.best = score
+
+        # update weight
+        if self.fails >= self.patience:
+            self.weight = max(self.min_weight, self.weight * self.factor)
+
+    def apply_weight(self, loss):    # must be called after step
+        return self.weight * loss
+
+
+class Scheduler:
+    def __init__(self, *specs, **kwargs):
+        self.specs = {lang: Spec(dict(kwargs, **spec)) for lang, spec in specs}
+
+    def step(self, lang, score):
+        return self.specs[lang].step(score)
+
+    def apply_weight(self, lang, loss):
+        return self.specs[lang].apply_weight(loss)
+
+    def __repr__(self):
+        string = '<Scheduler>\n'
+        keys = ['weight', 'fails', 'patience', 'best']
+        for lang, spec in self.specs.items():
+            string += '\t<{} {}/>\n'.format(
+                lang, ' '.join('{}="{}"'.format(k, getattr(spec, k)) for k in keys))
+        string += '</Scheduler>'
+        return string
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
@@ -207,6 +331,7 @@ if __name__ == '__main__':
     parser.add_argument("--langs", nargs='+',
                         default=("ca", "fr", "gl", "pt", "es", "it", "ro"))
     parser.add_argument("--prepend", nargs="*", default=("char", "lemma"))
+    parser.add_argument("--target_lang")
     # training
     parser.add_argument("--sampling", default="oversampling")
     parser.add_argument("--batch_size", default=25, type=int)
@@ -219,8 +344,11 @@ if __name__ == '__main__':
     parser.add_argument("--clip_norm", default=5, type=float)
     parser.add_argument("--optimizer", default='Adam')
     # model
+    parser.add_argument("--share", nargs='*', default=('encoder', 'decoder'))
+    # add extra lang_id embedding as input to sentence encoder
+    parser.add_argument("--prepend_dim", type=int, default=0)
     parser.add_argument("--cell", default="GRU")
-    parser.add_argument("--num_layers", default=1, type=int)
+    parser.add_argument("--num_layers", default=0, type=int)
     parser.add_argument("--hidden_size", default=150, type=int)
     parser.add_argument("--wemb_dim", default=0, type=int)
     parser.add_argument("--cemb_dim", default=300, type=int)
@@ -232,10 +360,9 @@ if __name__ == '__main__':
     parser.add_argument("--results_path", default="results.csv")
 
     args = parser.parse_args()
-    print(args.langs, args.prepend)
-
-    if args.sampling not in ("oversampling", "balanced"):
-        raise ValueError("Unknown sampling method", args.sampling)
+    print("langs", args.langs)
+    print("prepend", args.prepend)
+    print("share", args.share)
 
     def get_paths(langpath, splits=('train', 'test', 'dev')):
         paths = glob.glob(os.path.join(langpath, '*conllu'))
@@ -259,27 +386,49 @@ if __name__ == '__main__':
     langs = {lang: langs[lang] for lang in args.langs}
 
     print("Creating readers for langs,", sorted(langs))
-    readers = {lang: LanguageReader(get_paths(os.path.join(root, path))[0])
+    readers = {lang: dataset.LanguageReader(get_paths(os.path.join(root, path))[0])
                for lang, path in langs.items()}
-    encoder = MultiLanguageEncoder(list(langs), prepend=args.prepend)
+    encoder = dataset.MultiLanguageEncoder(list(langs), prepend=args.prepend,
+                                           share_encoder='encoder' in args.share,
+                                           share_decoder='decoder' in args.share)
     encoder.fit_readers(readers)
-    dataset = MultiLanguageDataset(encoder, readers, args.batch_size, args.device)
-    devreaders = {lang: LanguageReader(get_paths(os.path.join(root, path))[2])
+    if args.sampling == 'oversampling':
+        trainset = dataset.MultiLanguageOversampling(
+            encoder, readers, args.batch_size, args.device)
+    elif args.sampling == 'balanced':
+        trainset = dataset.MultiLanguageBalanced(
+            encoder, readers, args.batch_size, args.device)
+    else:
+        raise ValueError("Unknown sampling type", args.sampling)
+    devreaders = {lang: dataset.LanguageReader(get_paths(os.path.join(root, path))[2])
                   for lang, path in langs.items()}
 
     print("Creating model")
     model = Model(encoder, args.cemb_dim, args.hidden_size, args.num_layers,
-                  dropout=args.dropout, cemb_layers=args.cemb_layers, cell=args.cell)
+                  dropout=args.dropout, cemb_layers=args.cemb_layers, cell=args.cell,
+                  prepend_dim=args.prepend_dim)
     print(model)
     print("* Parameters", sum(p.nelement() for p in model.parameters()))
     model.to(args.device)
 
+    # scheduler
+    target = scheduler = None
+    if args.target_lang:
+        target = args.target_lang
+        assert target in langs, 'Unknown lang: {}'.format(target)
+        scheduler = Scheduler(
+            # don't down-weigh target
+            *[(lang, {"min_weight": 1 if lang == target else 0}) for lang in langs],
+            factor=0.5)
+        print(scheduler)
+
     print("Starting training")
-    params = model.train_epochs(dataset, devreaders, args.epochs, args.sampling,
+    params = model.train_epochs(trainset, devreaders, args.epochs,
                                 args.clip_norm, args.report_freq,
-                                args.patience, args.lr_factor,
+                                args.patience, args.lr_factor, args.optimizer,
+                                scheduler=scheduler, target=target,
                                 # optimizer params
-                                args.optimizer, lr=args.lr)
+                                lr=args.lr)
 
     if not args.test:
         print("Saving results to '{}'".format(args.results_path))
