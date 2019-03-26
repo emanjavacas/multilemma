@@ -292,3 +292,26 @@ class MultiLanguageBalanced(MultiLanguageDataset):
                     encoder, next(iters[lang]), device=self.device,
                     lang=lang, prepend=self.encoder.prepend)
                 yield batch, lang
+
+
+class MultiLanguageScheduled(MultiLanguageDataset):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # store schedule params
+
+    def get_batches(self):
+        raise NotImplementedError
+
+    def update(self, iteration):
+        pass
+
+
+# import numpy as np
+# # def mean_average_precision(m, labels):
+# m = np.random.normal(0, 1, (100, 2000))
+# qy = np.random.randint(0, 20, 100)
+# ty = np.random.randint(0, 20, 2000)
+# trues = qy[:, None] == ty[None, :]
+# m_ranks = np.argsort(m, axis=1)
+# x, _ = np.indices(m.shape)
+# trues_ranks = trues[x, m_ranks].astype(float)

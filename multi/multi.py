@@ -231,8 +231,6 @@ class Model(nn.Module):
             self.train_epoch(
                 dataset.get_batches(), optim, clip_norm, report_freq,
                 scheduler=scheduler)
-            if scheduler is not None:
-                print(scheduler)
             self.eval()
 
             # evaluate
@@ -253,6 +251,9 @@ class Model(nn.Module):
                 print()
             acc = total / (len(self.encoder.languages) if target is None else 1)
             print("* Epoch {} => Mean accuracy {:.4f}".format(epoch, acc))
+
+            if scheduler is not None:
+                print(scheduler)
 
             # monitor
             if acc - best <= 0.0001:
@@ -306,10 +307,10 @@ class Spec:
 
 class Scheduler:
     def __init__(self, *specs, **kwargs):
-        self.specs = {lang: Spec(dict(kwargs, **spec)) for lang, spec in specs}
+        self.specs = {lang: Spec(**dict(kwargs, **spec)) for lang, spec in specs}
 
     def step(self, lang, score):
-        return self.specs[lang].step(score)
+        self.specs[lang].step(score)
 
     def apply_weight(self, lang, loss):
         return self.specs[lang].apply_weight(loss)
