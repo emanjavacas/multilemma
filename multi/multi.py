@@ -246,6 +246,101 @@ class Model(nn.Module):
         acc_unk = float(accuracy_score(true_unk, pred_unk))
         return acc, acc_amb, acc_unk
 
+    def train_batches(self, dataset, devreaders, optimizer, clip_norm,
+                      report_freq, check_freq, patience, lr_factor,
+                      scheduler=None, target=None, **kwargs):
+
+        optim = getattr(torch.optim, optimizer)(self.parameters(), **kwargs)
+        best = tries = 0
+        best_params = self.state_dict()
+        for k, v in best_params.items():
+            best_params[k] = v.to('cpu')
+        # report
+        stats = {}
+        stats['loss'] = collections.defaultdict(float)
+        stats['batches'] = collections.defaultdict(int)
+        stats['start'] = time.time()
+        stats['nwords'] = 0
+
+        for b, (batch_data, lang) in enumerate(dataset.get_unlimited_batches()):
+
+            self.train()
+            # loss
+            loss, nwords = self.loss(batch_data, lang)
+
+            # optimize
+            optim.zero_grad()
+            (scheduler.apply_weight(lang, loss) if scheduler else loss).backward()
+            if clip_norm > 0:
+                nn.utils.clip_grad_norm_(self.parameters(), clip_norm)
+            optim.step()
+
+            # accumulate
+            stats['loss'][lang] += loss.item()
+            stats['batches'][lang] += 1
+            stats['nwords'] += nwords
+
+            # report
+            if b > 0 and b % report_freq == 0:
+                losses = ""
+                for lang, loss in sorted(stats['loss'].items()):
+                    losses += "{}:{:.3f}  ".format(lang, loss / stats['batches'][lang])
+                logging.info("Batch [{}] || {} || {:.0f} words/sec".format(
+                    b, losses, stats['nwords'] / (time.time() - stats['start'])))
+                # reset
+                stats = {}
+                stats['loss'] = collections.defaultdict(float)
+                stats['batches'] = collections.defaultdict(int)
+                stats['start'] = time.time()
+                stats['nwords'] = 0
+
+            # evaluate
+            if b > 0 and b % check_freq == 0:
+                self.eval()
+                total = 0
+                for lang in sorted(devreaders):
+                    acc, acc_amb, acc_unk = self.evaluate(devreaders[lang], lang)
+                    if scheduler is not None:
+                        scheduler.step(lang, acc)
+                    if target is not None:
+                        if lang == target:
+                            total = acc
+                    else:
+                        total += acc
+                    print("Lang:", lang)
+                    print("* Overall accuracy: {:.4f}".format(acc))
+                    print("* Ambiguous accuracy: {:.4f}".format(acc_amb))
+                    print("* Unknown accuracy: {:.4f}".format(acc_unk))
+                    print()
+
+                acc = total / (len(self.encoder.languages) if target is None else 1)
+                print("* => Mean accuracy {:.4f}".format(acc))
+
+                if scheduler is not None:
+                    print(scheduler)
+
+                # monitor
+                if acc - best <= 0.0001:
+                    tries += 1
+                    if tries > 5:
+                        optim.param_groups[0]['lr'] *= lr_factor
+                        print("* New learning rate: {:.8f}".format(
+                            optim.param_groups[0]['lr']))
+                else:
+                    tries = 0
+                    best = acc
+                    best_params = self.state_dict()
+                    for k, v in best_params.items():
+                        best_params[k] = v.to('cpu')
+
+                # early stopping
+                if tries == patience:
+                    logging.info("Finished training after {} tries!".format(patience))
+                    logging.info("Best dev accuracy {:.4f}".format(best))
+                    break
+
+        return best_params
+
     def train_epoch(self, batches, optimizer, clip_norm, report_freq, scheduler=None):
         stats = {}
         stats['loss'] = collections.defaultdict(float)

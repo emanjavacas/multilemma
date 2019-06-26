@@ -308,6 +308,19 @@ class MultiLanguageDataset:
     def get_batches(self):
         raise NotImplementedError
 
+    def get_unlimited_batches(self):
+        iters = {lang: iter(it) for lang, it in self.iters.items()}
+        while True:
+            lang = random.choice(list(iters))
+            if self.iters[lang].done:
+                self.iters[lang].reset()
+
+            encoder = self.encoder.get_lang_encoder(lang)
+            batch = prepare_batch(
+                encoder, next(iters[lang]), device=self.device,
+                lang=lang, prepend=self.encoder.prepend)
+
+            yield batch, lang
 
 class MultiLanguageOversampling(MultiLanguageDataset):
     def get_batches(self):
@@ -363,14 +376,3 @@ class MultiLanguageScheduled(MultiLanguageDataset):
 
     def update(self, iteration):
         pass
-
-
-# import numpy as np
-# # def mean_average_precision(m, labels):
-# m = np.random.normal(0, 1, (100, 2000))
-# qy = np.random.randint(0, 20, 100)
-# ty = np.random.randint(0, 20, 2000)
-# trues = qy[:, None] == ty[None, :]
-# m_ranks = np.argsort(m, axis=1)
-# x, _ = np.indices(m.shape)
-# trues_ranks = trues[x, m_ranks].astype(float)
