@@ -62,9 +62,11 @@ class Model(nn.Module):
         if num_layers > 0:
             in_dim = embedding_dim
             if prepend_dim:
-                self.lang_encoder = nn.Embedding(len(self.encoder.languages), prepend_dim)
+                self.lang_encoder = nn.Embedding(
+                    len(self.encoder.languages), prepend_dim)
                 in_dim += prepend_dim
-                self.lang_w2i = {lang: idx for idx, lang in enumerate(self.encoder.languages)}
+                self.lang_w2i = {
+                    lang: idx for idx, lang in enumerate(self.encoder.languages)}
             self.rnn_encoder = RNNEncoder(in_dim, hidden_size, num_layers=num_layers,
                                           cell=cell, dropout=dropout, init_rnn=init_rnn)
             context_dim = hidden_size * 2
@@ -379,8 +381,11 @@ class Model(nn.Module):
                 stats['nwords'] = 0
 
     def train_epochs(self, dataset, devreaders, epochs, clip_norm, report_freq, patience,
-                     lr_factor, optimizer, scheduler=None, target=None, **kwargs):
+                     lr_factor, lr_patience, optimizer, scheduler=None, target=None,
+                     **kwargs):
         optim = getattr(torch.optim, optimizer)(self.parameters(), **kwargs)
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optim, mode='max', factor=lr_factor, patience=lr_patience, min_lr=1e-6)
         best = tries = 0
         best_params = self.state_dict()
         for k, v in best_params.items():
@@ -416,14 +421,14 @@ class Model(nn.Module):
             acc = total / (len(self.encoder.languages) if target is None else 1)
             print("* Epoch {} => Mean accuracy {:.4f}".format(epoch, acc))
 
+            lr_scheduler.step(acc)
             if scheduler is not None:
                 print(scheduler)
+                print("* Learning rate: {:.8f}".format(optim.param_groups[0]['lr']))
 
             # monitor
             if acc - best <= 0.0001:
                 tries += 1
-                optim.param_groups[0]['lr'] *= lr_factor
-                print("* New learning rate: {:.8f}".format(optim.param_groups[0]['lr']))
             else:
                 tries = 0
                 best = acc
@@ -501,9 +506,11 @@ if __name__ == '__main__':
     parser.add_argument("--sampling", default="oversampling")
     parser.add_argument("--batch_size", default=25, type=int)
     parser.add_argument("--dropout", default=0.25, type=float)
-    parser.add_argument("--lr", default=0.001, type=float)
-    parser.add_argument("--lr_factor", default=0.75, type=float)
-    parser.add_argument("--patience", default=3, type=int)
+    parser.add_argument("--lr", default=0.0008, type=float)
+    parser.add_argument("--lr_factor", default=0.5, type=float)
+    parser.add_argument("--lr_patience", default=2, type=int)
+    parser.add_argument("--aux_patience", default=3, type=int)
+    parser.add_argument("--patience", default=5, type=int)
     parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument("--device", default='cpu')
     parser.add_argument("--clip_norm", default=5, type=float)
@@ -513,7 +520,7 @@ if __name__ == '__main__':
     # add extra lang_id embedding as input to sentence encoder
     parser.add_argument("--prepend_dim", type=int, default=0)
     parser.add_argument("--cell", default="GRU")
-    parser.add_argument("--num_layers", default=0, type=int)
+    parser.add_argument("--num_layers", default=1, type=int)
     parser.add_argument("--hidden_size", default=150, type=int)
     parser.add_argument("--wemb_dim", default=0, type=int)
     parser.add_argument("--cemb_dim", default=300, type=int)
@@ -523,14 +530,17 @@ if __name__ == '__main__':
     parser.add_argument("--report_freq", default=200, type=int)
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--results_path", default="results.csv")
+    parser.add_argument("--disable_cudnn", action='store_true')
 
     args = parser.parse_args()
+    if args.disable_cudnn:
+        torch.backends.cudnn.enabled = False
     print("langs", args.langs)
     print("prepend", args.prepend)
     print("share", args.share)
 
-    def get_paths(langpath, splits=('train', 'test', 'dev')):
-        paths = glob.glob(os.path.join(langpath, '*conllu'))
+    def get_paths(langpath, ext='conllu', splits=('train', 'test', 'dev')):
+        paths = glob.glob(os.path.join(langpath, '*{}'.format(ext)))
         output = []
         for split in splits:
             for path in paths:
@@ -539,23 +549,39 @@ if __name__ == '__main__':
 
         return output
 
-    root = 'datasets/ud-treebanks-v2.2/'
+    # root = 'datasets/ud-treebanks-v2.2/'
+    # langs = {
+    #     'ca': 'UD_Catalan-AnCora',
+    #     'fr': 'UD_French-GSD',
+    #     'gl': 'UD_Galician-CTG',
+    #     'pt': 'UD_Portuguese-GSD',
+    #     'es': 'UD_Spanish-GSD',
+    #     'it': 'UD_Italian-ISDT',
+    #     'ro': 'UD_Romanian-RRT'}
+
+    # historical
+    root = 'datasets/'
     langs = {
-        'ca': 'UD_Catalan-AnCora',
-        'fr': 'UD_French-GSD',
-        'gl': 'UD_Galician-CTG',
-        'pt': 'UD_Portuguese-GSD',
-        'es': 'UD_Spanish-GSD',
-        'it': 'UD_Italian-ISDT',
-        'ro': 'UD_Romanian-RRT'}
+        'cga': 'gysseling/cg-admin',
+        'cgl': 'gysseling/cg-lit',
+        'crm': 'gysseling/crm-adelheid',
+        'rel': 'gysseling/relig',
+        # 'ren': 'ren/'
+    }
+
     langs = {lang: langs[lang] for lang in args.langs}
 
     print("Creating readers for langs,", sorted(langs))
-    readers = {lang: dataset.LanguageReader(get_paths(os.path.join(root, path))[0])
-               for lang, path in langs.items()}
-    encoder = dataset.MultiLanguageEncoder(list(langs), prepend=args.prepend,
-                                           share_encoder='encoder' in args.share,
-                                           share_decoder='decoder' in args.share)
+    readers = {}
+    for lang, path in langs.items():
+        train, *_ = get_paths(os.path.join(root, path), ext='tab')
+        print(train)
+        readers[lang] = dataset.LanguageReader(train, linereader=dataset.readlines)
+
+    encoder = dataset.MultiLanguageEncoder(
+        list(readers), prepend=args.prepend,
+        share_encoder='encoder' in args.share,
+        share_decoder='decoder' in args.share)
     encoder.fit_readers(readers)
     if args.sampling == 'oversampling':
         trainset = dataset.MultiLanguageOversampling(
@@ -587,16 +613,26 @@ if __name__ == '__main__':
         scheduler = Scheduler(
             # don't down-weigh target
             *[(lang, {"min_weight": 1 if lang == target else 0}) for lang in langs],
-            factor=0.5)
+            # params for all languages
+            factor=0.5,
+            patience=args.aux_patience)
         print(scheduler)
 
     print("Starting training")
     params = model.train_epochs(trainset, devreaders, args.epochs,
                                 args.clip_norm, args.report_freq,
-                                args.patience, args.lr_factor, args.optimizer,
+                                args.patience, args.lr_factor,
+                                args.lr_patience, args.optimizer,
                                 scheduler=scheduler, target=target,
                                 # optimizer params
                                 lr=args.lr)
+
+    # params = model.train_batches(trainset, devreaders, args.optimizer,
+    #                              args.clip_norm, args.report_freq, 500,
+    #                              args.patience, args.lr_factor,
+    #                              scheduler=scheduler, target= target,
+    #                              # optimizer params
+    #                              lr=args.lr)
 
     if not args.test:
         print("Saving results to '{}'".format(args.results_path))
