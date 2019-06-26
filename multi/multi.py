@@ -1,4 +1,7 @@
 
+
+import tarfile
+import json
 import os
 import glob
 import collections
@@ -23,6 +26,13 @@ class Model(nn.Module):
                  prepend_dim=0):
         self.encoder = encoder
         self.dropout = dropout
+        self.cemb_dim = cemb_dim
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.cemb_layers = cemb_layers
+        self.cell = cell
+        self.scorer = scorer
+        self.prepend_dim = prepend_dim
         super().__init__()
 
         # Embeddings
@@ -79,6 +89,65 @@ class Model(nn.Module):
                 self.add_module('{}-decoder'.format(lang), lang_decoder)
                 decoder[lang] = lang_decoder
             self.decoder = decoder
+
+    def get_args_and_kwargs(self):
+        return {"args": [self.cemb_dim, self.hidden_size],
+                "kwargs": {
+                    "dropout": self.dropout,
+                    "num_layers": self.num_layers,
+                    "cemb_layers": self.cemb_layers,
+                    "cell": self.cell,
+                    "scorer": self.scorer,
+                    "prepend_dim": self.prepend_dim}}
+
+    def save(self, fpath, settings):
+        """
+        Serialize model to path
+        """
+        import pie
+        fpath = pie.utils.ensure_ext(fpath, 'tar')
+
+        # create dir if necessary
+        dirname = os.path.dirname(fpath)
+        if not os.path.isdir(dirname):
+            os.makedirs(dirname)
+
+        with tarfile.open(fpath, 'w') as tar:
+            # serialize label_encoder
+            string = json.dumps(self.encoder.to_dict())
+            path = 'label_encoder.zip'
+            pie.utils.add_gzip_to_tar(string, path, tar)
+
+            # serialize parameters
+            string, path = json.dumps(self.get_args_and_kwargs()), 'parameters.zip'
+            pie.utils.add_gzip_to_tar(string, path, tar)
+
+            # serialize weights
+            pie.utils.add_weights_to_tar(self.state_dict(), 'state_dict.pt', tar)
+
+            # if passed, serialize settings
+            string, path = json.dumps(settings), 'settings.zip'
+            pie.utils.add_gzip_to_tar(string, path, tar)
+
+        return fpath
+
+    @classmethod
+    def load(cls, fpath):
+        import pie
+
+        with tarfile.open(pie.utils.ensure_ext(fpath, 'tar'), 'r') as tar:
+            # load label encoder
+            le = dataset.MultiLanguageEncoder.from_dict(
+                json.loads(pie.utils.get_gzip_from_tar(tar, 'label_encoder.zip')))
+            # load model parameters
+            params = json.loads(pie.utils.get_gzip_from_tar(tar, 'parameters.zip'))
+            print(params)
+            inst = cls(le, *params['args'], **params['kwargs'])
+            inst.load_state_dict(
+                torch.load(tar.extractfile('state_dict.pt'), map_location='cpu'))
+            inst.eval()
+
+        return inst, le
 
     def device(self):
         return next(self.parameters()).device
@@ -472,3 +541,6 @@ if __name__ == '__main__':
                         print("Missing arg", key)
                         row.append("NA")
                 f.write('\t'.join(map(str, row)) + '\n')
+
+        # serialize model
+        model.save('models/' + str(run) + '.tar', args)

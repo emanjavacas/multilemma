@@ -192,6 +192,28 @@ class MultiLanguageEncoder:
         self.known = collections.defaultdict(collections.Counter)
         self.ambig = collections.defaultdict(lambda: collections.defaultdict(set))
 
+    def to_dict(self):
+        return {'char': {lang: le.jsonify() for lang, le in self.char.items()},
+                'lemma': {lang: le.jsonify() for lang, le in self.lemma.items()},
+                'languages': self.languages,
+                'share_encoder': self.share_encoder,
+                'share_decoder': self.share_decoder,
+                'prepend': self.prepend,
+                'ambig': {lang: list(s) for lang, s in self.ambig.items()},
+                'known': {lang: dict(d) for lang, d in self.known.items()}}
+
+    @classmethod
+    def from_dict(cls, d):
+        inst = cls(d['languages'],
+                   share_encoder=d['share_encoder'], share_decoder=d['share_decoder'],
+                   prepend=tuple(d['prepend']))
+        inst.char = {lang: LabelEncoder.from_json(d) for lang, d in d['char'].items()}
+        inst.lemma = {lang: LabelEncoder.from_json(d) for lang, d in d['lemma'].items()}
+        inst.ambig = {lang: set(s) for lang, s in d['ambig'].items()}
+        inst.known = d['known']
+
+        return inst
+
     def fit_readers(self, lreaders, verbose=True):
         for lang, reader in lreaders.items():
             for sent, tasks in reader.readsents():
