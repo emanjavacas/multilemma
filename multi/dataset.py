@@ -11,7 +11,7 @@ import random
 random.seed(1001)
 
 
-def readlines(path, skip_contractions=False):
+def readlines_conll(path, skip_contractions=False):
     """
     path: str, path to file with data
     skip_contractions: bool, whether to skip contracted forms.
@@ -51,6 +51,41 @@ def readlines(path, skip_contractions=False):
                 sent.append(token)
                 for task, data in {'lemma': lemma, 'pos': pos, 'ppos': ppos}.items():
                     tasks[task].append(data)
+
+        if sent:
+            yield sent, dict(tasks)
+
+
+def readlines(path, maxlen=35):
+    """
+    path: str, path to file with data
+    maxlen: int, maximum sentence length
+    """
+    with open(path) as f:
+        # skip header
+        next(f)
+        sent, tasks = [], collections.defaultdict(list)
+
+        for line in f:
+            line = line.strip()
+
+            # new sentence marker
+            if not line:
+                yield sent, dict(tasks)
+                sent, tasks = [], collections.defaultdict(list)
+
+            # actual line
+            else:
+                token, lemma, pos, *_ = line.split()
+
+                # accumulate
+                sent.append(token)
+                for task, data in {'lemma': lemma, 'pos': pos}.items():
+                    tasks[task].append(data)
+
+                if len(sent) >= maxlen:
+                    yield sent, dict(tasks)
+                    sent, tasks = [], collections.defaultdict(list)
 
         if sent:
             yield sent, dict(tasks)
@@ -97,15 +132,17 @@ class BatchIterator:
 
 
 class LanguageReader:
-    def __init__(self, path, buffersize=25000, maxlen=25, minlen=0):
+    def __init__(self, path,
+                 linereader=readlines_conll, buffersize=25000, maxlen=35, minlen=0):
         self.path = path
+        self.linereader = linereader
         self.buffersize = buffersize
         self.maxlen = maxlen
         self.minlen = minlen
 
     def readsents(self):
         buf = []
-        for sent, tasks in readlines(self.path):
+        for sent, tasks in self.linereader(self.path):
 
             if len(sent) < self.minlen:
                 continue

@@ -401,8 +401,11 @@ if __name__ == '__main__':
             encoder, readers, args.batch_size, args.device)
     else:
         raise ValueError("Unknown sampling type", args.sampling)
-    devreaders = {lang: dataset.LanguageReader(get_paths(os.path.join(root, path))[2])
-                  for lang, path in langs.items()}
+    devreaders = {
+        lang: dataset.LanguageReader(
+            get_paths(os.path.join(root, path), ext='tab')[2],
+            linereader=dataset.readlines)  # only for historical languages
+        for lang, path in langs.items()}
 
     print("Creating model")
     model = Model(encoder, args.cemb_dim, args.hidden_size, args.num_layers,
